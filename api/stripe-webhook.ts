@@ -50,8 +50,9 @@ async function readRawBody(req: VercelRequest): Promise<Buffer> {
   });
 }
 
-// Build the ntfy body. Plain text only -- URLs go in the Actions header per
-// the CLAUDE.md ntfy URL rule. Total length kept under ~200 chars for phone.
+// Build the ntfy body for a NEW payment (first time -- one-time launch fee
+// or first month of a subscription). Plain text only -- URLs go in the Actions
+// header per the CLAUDE.md ntfy URL rule. Kept under ~200 chars for phone.
 function buildNtfyBody(
   tier: string,
   customerName: string,
@@ -61,15 +62,35 @@ function buildNtfyBody(
   return `Stripe just paid: ${tier} from ${who}. Click Paid in the dashboard.`;
 }
 
+// Build the ntfy body for a RECURRING renewal payment (months 2+).
+// Adds the "paid through" date so Johnathon knows when the next renewal hits.
+function buildRenewalBody(
+  tier: string,
+  customerName: string,
+  customerEmail: string | undefined,
+  periodEndSeconds: number | null
+): string {
+  const who = customerName || customerEmail || 'customer';
+  let nextStr = '';
+  if (periodEndSeconds && periodEndSeconds > 0) {
+    try {
+      const d = new Date(periodEndSeconds * 1000);
+      const formatted = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      nextStr = ` Paid through ${formatted}.`;
+    } catch {}
+  }
+  return `Renewal: ${tier} from ${who}.${nextStr}`;
+}
+
 // Fire the ntfy. Never throws -- a failed ntfy must not cause Stripe to retry
 // (the money is already collected). Log to Vercel function logs instead.
-async function sendNtfy(body: string): Promise<void> {
+async function sendNtfy(body: string, title: string = 'Money landed'): Promise<void> {
   try {
     const r = await fetch(NTFY_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'text/plain; charset=utf-8',
-        'Title': 'Money landed',
+        'Title': title,
         'Actions': `view, Open Dashboard, ${DASHBOARD_URL}`,
       },
       body,
@@ -129,32 +150,71 @@ export default async function handler(
     return;
   }
 
-  // We only care about completed checkouts for now. Future events (refunded,
-  // disputed, subscription canceled) can be added here as `else if` branches.
-  if (event.type !== 'checkout.session.completed') {
-    console.log('Ignoring event type:', event.type);
-    res.status(200).json({ received: true, ignored: event.type });
+  // Branch by event type. We handle:
+  //   - checkout.session.completed -- new payment (launch fee OR first month of sub)
+  //   - invoice.paid              -- recurring renewal (months 2+ of a subscription)
+  // Future events (refunded, disputed, subscription canceled) can be added as
+  // additional branches.
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object as Stripe.Checkout.Session;
+    const amountCents = session.amount_total ?? 0;
+    const mode = session.mode ?? 'payment';
+    const customerName = session.customer_details?.name ?? '';
+    const customerEmail = session.customer_details?.email ?? undefined;
+
+    const tier = tierFromAmount(amountCents, mode);
+    const body = buildNtfyBody(tier, customerName, customerEmail);
+
+    console.log('Stripe paid (checkout.session.completed):', {
+      tier, customerName, customerEmail, mode, amountCents,
+    });
+    await sendNtfy(body, 'Money landed');
+
+    res.status(200).json({
+      received: true,
+      type: 'checkout.session.completed',
+      tier,
+      customer: customerName || customerEmail || null,
+    });
     return;
   }
 
-  const session = event.data.object as Stripe.Checkout.Session;
-  const amountCents = session.amount_total ?? 0;
-  const mode = session.mode ?? 'payment';
-  const customerName = session.customer_details?.name ?? '';
-  const customerEmail = session.customer_details?.email ?? undefined;
+  if (event.type === 'invoice.paid') {
+    const invoice = event.data.object as Stripe.Invoice;
 
-  const tier = tierFromAmount(amountCents, mode);
-  const body = buildNtfyBody(tier, customerName, customerEmail);
+    // Skip the FIRST invoice of a new subscription -- that's already handled
+    // by checkout.session.completed above, and we don't want to double-ntfy
+    // on signup. billing_reason === 'subscription_create' marks the first one.
+    if (invoice.billing_reason === 'subscription_create') {
+      console.log('Skipping first-invoice (covered by checkout.session.completed):', invoice.id);
+      res.status(200).json({ received: true, skipped: 'first-invoice' });
+      return;
+    }
 
-  console.log('Stripe paid:', { tier, customerName, customerEmail, mode, amountCents });
+    const amountCents = invoice.amount_paid ?? 0;
+    const customerName = invoice.customer_name ?? '';
+    const customerEmail = invoice.customer_email ?? undefined;
+    const periodEnd = invoice.period_end ?? null;
 
-  // Fire the ntfy. Don't await indefinitely -- Stripe expects a response
-  // within ~5s. The ntfy call has its own internal timeout via fetch.
-  await sendNtfy(body);
+    const tier = tierFromAmount(amountCents, 'subscription');
+    const body = buildRenewalBody(tier, customerName, customerEmail, periodEnd);
 
-  res.status(200).json({
-    received: true,
-    tier,
-    customer: customerName || customerEmail || null,
-  });
+    console.log('Stripe paid (invoice.paid renewal):', {
+      tier, customerName, customerEmail, amountCents,
+      billing_reason: invoice.billing_reason,
+      invoice_id: invoice.id,
+    });
+    await sendNtfy(body, 'Renewal paid');
+
+    res.status(200).json({
+      received: true,
+      type: 'invoice.paid',
+      tier,
+      customer: customerName || customerEmail || null,
+    });
+    return;
+  }
+
+  console.log('Ignoring event type:', event.type);
+  res.status(200).json({ received: true, ignored: event.type });
 }
