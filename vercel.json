@@ -3,6 +3,15 @@
   "functions": {
     "api/stripe-webhook.ts": {
       "maxDuration": 10
+    },
+    "api/send-email.js": {
+      "maxDuration": 15
+    },
+    "api/create-checkout.js": {
+      "maxDuration": 10
+    },
+    "api/state.js": {
+      "maxDuration": 10
     }
   }
 }

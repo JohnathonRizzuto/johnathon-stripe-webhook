@@ -27,16 +27,30 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
 const NTFY_URL = process.env.NTFY_URL || 'https://ntfy.sh/johnathon-builds-2026';
 const DASHBOARD_URL = 'https://johnathon-builds.vercel.app/dashboard.html';
 
-// Map a Stripe amount + mode to the four pricing tiers from CLAUDE.md.
-// If the price doesn't match a known tier, fall back to "$XX.XX" formatting.
-function tierFromAmount(amountCents: number, mode: string): string {
+// Map a Stripe amount + mode + metadata to the pricing tiers from CLAUDE.md.
+// If the session metadata has combinedCheckout=true (from /api/create-checkout),
+// we recognize the new combined flow which charges $250 today + signs up for
+// the $25/mo with a 30-day trial. Otherwise we fall back to amount-based
+// tier matching for the old separate Payment Links.
+function tierFromAmount(
+  amountCents: number,
+  mode: string,
+  metadata?: Record<string, string> | null
+): string {
+  // Combined checkout (new flow). The amount_total is the launch fee
+  // because the recurring portion is in trial ($0 today).
+  if (metadata && metadata.combinedCheckout === 'true') {
+    const t = metadata.tier === 'store' ? 'store' : 'landing';
+    if (t === 'store') return 'Tier 2 Combined ($500 + $50/mo after 30d trial)';
+    return 'Tier 1 Combined ($250 + $25/mo after 30d trial)';
+  }
   if (mode === 'subscription') {
-    if (amountCents === 2500) return 'Landing Page Hosting ($25/mo)';
-    if (amountCents === 5000) return 'Online Store Hosting ($50/mo)';
+    if (amountCents === 2500) return 'Tier 1 Hosting ($25/mo)';
+    if (amountCents === 5000) return 'Tier 2 Hosting ($50/mo)';
     return `$${(amountCents / 100).toFixed(2)}/mo recurring`;
   }
-  if (amountCents === 25000) return 'Landing Page Launch ($250)';
-  if (amountCents === 50000) return 'Online Store Launch ($500)';
+  if (amountCents === 25000) return 'Tier 1 Launch ($250)';
+  if (amountCents === 50000) return 'Tier 2 Launch ($500)';
   return `$${(amountCents / 100).toFixed(2)} one-time`;
 }
 
@@ -80,6 +94,118 @@ function buildRenewalBody(
     } catch {}
   }
   return `Renewal: ${tier} from ${who}.${nextStr}`;
+}
+
+// Build the welcome email body for a customer who just paid. Tier-specific
+// copy so they see something relevant to what they bought. Plain text.
+function buildWelcomeEmail(tier: string, amountCents: number, mode: string): { subject: string; body: string } {
+  const isStore = tier.toLowerCase().includes('store');
+  const isCombined = tier.toLowerCase().includes('combined');
+  const isLaunch = mode === 'payment';
+
+  // Combined launch + subscription with 30-day trial. Customer paid the
+  // setup fee today; their first recurring charge hits in 30 days.
+  if (isCombined) {
+    const product = isStore ? 'online store' : 'website';
+    const launchAmt = isStore ? '$500' : '$250';
+    const monthlyAmt = isStore ? '$50' : '$25';
+    return {
+      subject: `Payment received -- your ${product} is locked in`,
+      body:
+        `Hi,\n\n` +
+        `Thanks for the payment -- I just got confirmation. You're officially on the books.\n\n` +
+        `What you paid for today:\n\n` +
+        `  - ${launchAmt} one-time setup fee -- I convert your demo to a fully live site (real hours, real photos, real prices, no placeholders).\n` +
+        `  - ${monthlyAmt}/month hosting subscription -- starts in 30 days, billed automatically each month. Covers hosting, edits, and support.\n\n` +
+        `What happens next:\n\n` +
+        `  1. Within 24 hours I'll update your site with all the real info. The placeholder marks (asterisks next to prices, "REPLACE WITH REAL PHOTO" notes) will all be gone.\n\n` +
+        `  2. You'll get an editor link from me so you can change any text or photo yourself, anytime, from your phone. Takes 30 seconds. Hit Save and the change is live in 15 seconds.\n\n` +
+        `  3. Your first ${monthlyAmt}/month charge hits 30 days from today -- gives you a free month of hosting included with the setup. You can cancel anytime.\n\n` +
+        `Reply with anything you want updated -- photos, hours, copy changes, whatever -- and I'll get it on the site today.\n\n` +
+        `Thanks again,\n` +
+        `Johnathon\n` +
+        `Johnathon Builds`,
+    };
+  }
+
+  if (isLaunch) {
+    const product = isStore ? 'online store' : 'website';
+    return {
+      subject: `Payment received -- your ${product} is next`,
+      body:
+        `Hi,\n\n` +
+        `Thanks for the payment -- I just got confirmation for ${tier}. You're officially on the books.\n\n` +
+        `Here's what happens next:\n\n` +
+        `  1. Within the next 24 hours I'll update your site with the real info -- your hours, real photos if you've sent them, your email for the contact form, and your real prices. The placeholder marks (asterisks next to prices, "REPLACE WITH REAL PHOTO" notes) will all be gone.\n\n` +
+        `  2. You'll get an editor link from me so you can change any text or photo on your site yourself, anytime, from your phone. Takes 30 seconds. Hit Save and the change is live in 15 seconds.\n\n` +
+        `  3. Your $${isStore ? '50' : '25'}/month hosting kicks in 30 days from today. I'll send the recurring payment link separately so you can set it up when ready.\n\n` +
+        `If you want to send over photos, your real hours, or anything else now -- just reply to this email and I'll get them onto the site.\n\n` +
+        `Thanks again,\n` +
+        `Johnathon\n` +
+        `Johnathon Builds`,
+    };
+  }
+
+  // Subscription start (first month of hosting)
+  return {
+    subject: `Hosting subscription active -- you're all set`,
+    body:
+      `Hi,\n\n` +
+      `Just confirming your ${tier} subscription is active. Your site stays live and I handle the hosting, edits, and support from here.\n\n` +
+      `Need a change to the site? Reply to this email or text me anytime -- usually I can have it live in under an hour. You can also edit text and photos yourself through the editor link I sent earlier.\n\n` +
+      `Thanks for keeping it going,\n` +
+      `Johnathon`,
+  };
+}
+
+// POST to /api/send-email with the customer's welcome. Never throws -- email
+// failure must not cause Stripe to retry the webhook.
+async function sendWelcomeEmail(
+  to: string,
+  tier: string,
+  amountCents: number,
+  mode: string
+): Promise<void> {
+  const sendKey = process.env.SEND_EMAIL_KEY;
+  if (!sendKey) {
+    console.log('SEND_EMAIL_KEY not set, skipping welcome email');
+    return;
+  }
+  if (!to) {
+    console.log('No customer email on payment, skipping welcome email');
+    return;
+  }
+
+  const { subject, body } = buildWelcomeEmail(tier, amountCents, mode);
+  // Use the same Vercel project's /api/send-email -- relative URL works because
+  // both functions are deployed to the same project. Vercel exposes the
+  // project's own URL via the VERCEL_URL env var (host only, no scheme).
+  const host = process.env.VERCEL_URL || process.env.VERCEL_PROJECT_PRODUCTION_URL;
+  if (!host) {
+    console.error('VERCEL_URL env var not available, cannot self-call /api/send-email');
+    return;
+  }
+  const endpoint = `https://${host}/api/send-email`;
+
+  try {
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Send-Key': sendKey,
+      },
+      body: JSON.stringify({ to, subject, body, fromName: 'Johnathon Builds' }),
+    });
+    if (!r.ok) {
+      const text = await r.text().catch(() => '');
+      console.error('send-email returned non-2xx:', r.status, text);
+    } else {
+      console.log('Welcome email sent to', to);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'unknown';
+    console.error('send-email POST failed:', msg);
+  }
 }
 
 // Fire the ntfy. Never throws -- a failed ntfy must not cause Stripe to retry
@@ -161,14 +287,24 @@ export default async function handler(
     const mode = session.mode ?? 'payment';
     const customerName = session.customer_details?.name ?? '';
     const customerEmail = session.customer_details?.email ?? undefined;
+    // Metadata flows from /api/create-checkout. Includes combinedCheckout
+    // and tier so we can distinguish the new combined flow from a plain
+    // Payment Link checkout.
+    const metadata = (session.metadata || {}) as Record<string, string>;
 
-    const tier = tierFromAmount(amountCents, mode);
+    const tier = tierFromAmount(amountCents, mode, metadata);
     const body = buildNtfyBody(tier, customerName, customerEmail);
 
     console.log('Stripe paid (checkout.session.completed):', {
       tier, customerName, customerEmail, mode, amountCents,
     });
     await sendNtfy(body, 'Money landed');
+
+    // Auto-welcome email to the customer. Fire-and-forget -- failure logged
+    // but never blocks the 200 response.
+    if (customerEmail) {
+      await sendWelcomeEmail(customerEmail, tier, amountCents, mode);
+    }
 
     res.status(200).json({
       received: true,

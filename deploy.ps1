@@ -17,7 +17,11 @@
 #   5. Runs `vercel --prod` and captures the production URL
 #   6. Prints the URL you need to paste into Stripe's webhook config
 
-$ErrorActionPreference = "Stop"
+# PS 5.1 (Windows PowerShell) treats native-command stderr as a terminating
+# error when ErrorActionPreference is "Stop", and Vercel writes harmless
+# progress messages like "Loading scopes..." to stderr. Use Continue and
+# rely on explicit $LASTEXITCODE checks below.
+$ErrorActionPreference = "Continue"
 $PSNativeCommandUseErrorActionPreference = $false
 
 $slug = "johnathon-stripe-webhook"
